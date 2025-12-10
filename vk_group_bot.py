@@ -4,40 +4,43 @@
 """
 vk_group_bot.py
 
-Бот для постинга в стену сообщества ВК через VK API.
-После единовременной настройки токена больше не требует логина в ВК.
+Бот для постинга и редактирования постов на стене сообщества ВК.
 
-Настройка:
-  1) В группе: Управление -> Настройки -> Работа с API -> Ключи доступа -> Создать ключ.
-  2) Скопировать токен и ID группы в переменные окружения:
-       VK_GROUP_ID   - числовой ID группы (без минуса, например 12345678)
-       VK_GROUP_TOKEN - строка токена сообщества
+Переменные окружения:
 
-Использование:
-  # Новый пост
-  python vk_group_bot.py --message "Текст поста"
+  VK_GROUP_ID        - числовой ID группы (без минуса, например 12345678)
+  VK_GROUP_TOKEN     - токен сообщества (можно только для текстовых постов)
+  VK_USER_TOKEN      - ТЕПЕРЬ ЭТО REFRESH TOKEN (vk2.a....) от VK ID
+  VK_OAUTH_CLIENT_ID - ID приложения VK ID (через которое получали токены)
+  VK_OAUTH_CLIENT_SECRET - секрет этого приложения
 
-  # Новый пост с картинками
-  python vk_group_bot.py -m "Текст" -i img1.jpg -i img2.png
+Логика:
 
-  # Редактирование существующего поста
-  python vk_group_bot.py --edit 123 --message "Новый текст" -i img1.jpg
+  * Если есть VK_GROUP_TOKEN и пост без картинок, можем постить только им.
+  * Если нужно грузить картинки ИЛИ нет group-токена:
+      - по VK_USER_TOKEN (refresh_token) берём свежий access_token
+        через https://id.vk.com/oauth2/auth (grant_type=refresh_token)
+      - этим access_token вызываем photos.* и wall.*
+
+  * Если VK при refresh выдаёт новый refresh_token, скрипт печатает его
+    в stderr и просит обновить VK_USER_TOKEN в .env.
 """
 
 from dotenv import load_dotenv
 import argparse
 import os
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 API_BASE_URL = "https://api.vk.com/method"
 API_VERSION = "5.131"
+VK_OAUTH_TOKEN_URL = "https://id.vk.com/oauth2/auth"
 
 
 class VkApiError(RuntimeError):
-    """Ошибка, которую вернул VK API."""
+    """Ошибка VK API или OAuth VK ID."""
 
 
 def vk_request(method: str, params: Dict[str, Any]) -> Any:
@@ -71,7 +74,7 @@ def _load_binary_from_source(source: str) -> bytes:
         r = requests.get(source, timeout=30)
         r.raise_for_status()
         return r.content
-    # локальный файл
+
     if not os.path.exists(source):
         raise FileNotFoundError(f"Файл не найден: {source}")
     with open(source, "rb") as f:
@@ -80,23 +83,24 @@ def _load_binary_from_source(source: str) -> bytes:
 
 def upload_photos_for_wall(
     group_id: int,
-    token: str,
+    access_token: str,
     image_sources: List[str],
 ) -> List[str]:
     """
     Загрузить изображения и вернуть список строк вложений вида 'photo<owner_id>_<id>'.
 
     image_sources — список локальных путей или URL.
+    access_token — ПОЛЬЗОВАТЕЛЬСКИЙ access_token (НЕ токен сообщества!)
     """
     if not image_sources:
         return []
 
-    # Получаем URL для загрузки
+    # Важно: photos.getWallUploadServer работает только с user access token
     upload_server = vk_request(
         "photos.getWallUploadServer",
         {
             "group_id": group_id,
-            "access_token": token,
+            "access_token": access_token,
             "v": API_VERSION,
         },
     )
@@ -107,7 +111,6 @@ def upload_photos_for_wall(
     for src in image_sources:
         data = _load_binary_from_source(src)
 
-        # Отправляем файл на upload_url
         files = {"photo": ("image.jpg", data)}
         resp = requests.post(upload_url, files=files, timeout=60)
         resp.raise_for_status()
@@ -116,7 +119,6 @@ def upload_photos_for_wall(
         if not all(k in upload_result for k in ("photo", "server", "hash")):
             raise VkApiError(f"Неожиданный ответ сервера загрузки фото: {upload_result}")
 
-        # Сохраняем фото в альбом сообщества
         saved_photos = vk_request(
             "photos.saveWallPhoto",
             {
@@ -124,7 +126,7 @@ def upload_photos_for_wall(
                 "photo": upload_result["photo"],
                 "server": upload_result["server"],
                 "hash": upload_result["hash"],
-                "access_token": token,
+                "access_token": access_token,
                 "v": API_VERSION,
             },
         )
@@ -144,22 +146,20 @@ def post_to_group_wall(
     group_id: int,
     token: str,
     message: str,
-    attachments: List[str] | None = None,
+    attachments: Optional[List[str]] = None,
 ) -> int:
     """
     Добавить запись на стену сообщества.
 
-    group_id: числовой ID без минуса (12345678)
-    token: токен сообщества
-    message: текст поста
+    token: может быть group-токеном или user access_token.
     attachments: список строк вида 'photo<owner_id>_<id>'
 
     Возвращает post_id.
     """
-    owner_id = -group_id  # для групп owner_id = -group_id
+    owner_id = -group_id
     params: Dict[str, Any] = {
         "owner_id": owner_id,
-        "from_group": 1,        # пост от имени сообщества
+        "from_group": 1,
         "message": message,
         "access_token": token,
         "v": API_VERSION,
@@ -176,18 +176,12 @@ def edit_group_wall_post(
     token: str,
     post_id: int,
     message: str,
-    attachments: List[str] | None = None,
+    attachments: Optional[List[str]] = None,
 ) -> int:
     """
     Отредактировать существующий пост на стене сообщества.
 
-    group_id: числовой ID без минуса (12345678)
-    token: токен сообщества
-    post_id: ID редактируемого поста
-    message: новый текст
-    attachments: список строк вида 'photo<owner_id>_<id>' (заменяют старые вложения)
-
-    Возвращает post_id (обычно тот же).
+    token: лучше использовать user access_token, но часто работает и group.
     """
     owner_id = -group_id
     params: Dict[str, Any] = {
@@ -201,7 +195,7 @@ def edit_group_wall_post(
         params["attachments"] = ",".join(attachments)
 
     response = vk_request("wall.edit", params)
-    # wall.edit обычно возвращает 1, но на всякий случай пытаемся взять post_id
+    # Обычно возвращает 1, так что на всякий случай вернём исходный post_id
     return response.get("post_id", post_id)
 
 
@@ -225,7 +219,7 @@ def read_message_from_args(args: argparse.Namespace) -> str:
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Постинг и редактирование постов в стене сообщества ВК через токен сообщества.",
+        description="Постинг и редактирование постов в стене сообщества ВК.",
     )
     parser.add_argument(
         "-m",
@@ -245,6 +239,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Путь к картинке или URL (можно указать несколько раз).",
     )
     parser.add_argument(
+        "-a",
+        "--attachment",
+        action="append",
+        dest="attachments",
+        help=(
+            "Готовая строка вложения VK, например 'photo-12345678_987654321'. "
+            "Можно указать несколько раз."
+        ),
+    )
+    parser.add_argument(
         "--edit",
         type=int,
         help="Редактировать существующий пост с указанным post_id вместо создания нового.",
@@ -252,19 +256,67 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def refresh_access_token(
+    refresh_token: str,
+    client_id: str,
+    client_secret: str,
+) -> Tuple[str, Optional[str], Optional[int]]:
+    """
+    Обновить access_token по refresh_token через VK ID.
+
+    POST https://id.vk.com/oauth2/auth
+      grant_type=refresh_token
+      refresh_token=...
+      client_id=...
+      client_secret=...
+
+    Возвращает (access_token, new_refresh_token_or_None, expires_in_or_None).
+    """
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    resp = requests.post(VK_OAUTH_TOKEN_URL, data=data, headers=headers, timeout=15)
+    resp.raise_for_status()
+    token_data = resp.json()
+
+    if "error" in token_data:
+        raise VkApiError(
+            f"VK OAuth error {token_data.get('error')}: "
+            f"{token_data.get('error_description')}"
+        )
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise VkApiError("VK OAuth не вернул access_token при обновлении по refresh_token.")
+
+    new_refresh = token_data.get("refresh_token")
+    expires_in = token_data.get("expires_in")
+
+    return access_token, new_refresh, expires_in
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
 
-    # Берём настройки из окружения
     group_id_str = os.getenv("VK_GROUP_ID")
-    token = os.getenv("VK_GROUP_TOKEN")
+    group_token = os.getenv("VK_GROUP_TOKEN")  # токен сообщества (опционально)
 
-    if not group_id_str or not token:
+    # ВНИМАНИЕ: VK_USER_TOKEN = REFRESH TOKEN
+    refresh_token = os.getenv("VK_USER_TOKEN", None)
+
+    oauth_client_id = os.getenv("VK_OAUTH_CLIENT_ID")
+    oauth_client_secret = os.getenv("VK_OAUTH_CLIENT_SECRET")
+
+    if not group_id_str:
         print(
-            "Ошибка: не заданы VK_GROUP_ID и/или VK_GROUP_TOKEN.\n"
+            "Ошибка: не задан VK_GROUP_ID.\n"
             "Создай .env или выставь переменные окружения, например:\n"
-            "  export VK_GROUP_ID=12345678\n"
-            "  export VK_GROUP_TOKEN=vk1.a.XXXX\n",
+            "  export VK_GROUP_ID=12345678\n",
             file=sys.stderr,
         )
         return 1
@@ -289,27 +341,104 @@ def main(argv=None) -> int:
         print(f"Ошибка при чтении текста поста: {e}", file=sys.stderr)
         return 1
 
-    # Готовим вложения (если есть картинки)
-    try:
-        image_sources = args.images or []
-        attachments = (
-            upload_photos_for_wall(
+    attachments: List[str] = []
+
+    # 1) Уже готовые attachment-строки
+    if args.attachments:
+        attachments.extend(args.attachments)
+
+    # user_access_token будем получать по мере необходимости по refresh_token
+    user_access_token: Optional[str] = os.getenv("VK_ACCESS_TOKEN", None)
+
+    def ensure_user_access_token(reason: str) -> str:
+        """
+        Гарантировать наличие user access_token.
+
+        Если его ещё нет — берём по refresh_token.
+        """
+        nonlocal user_access_token, refresh_token
+
+        if user_access_token:
+            return user_access_token
+
+        if not refresh_token:
+            raise VkApiError(
+                f"Нужен VK_USER_TOKEN (refresh_token), чтобы {reason}. "
+                f"Сейчас VK_USER_TOKEN не задан."
+            )
+        if not oauth_client_id or not oauth_client_secret:
+            raise VkApiError(
+                f"Нужны VK_OAUTH_CLIENT_ID и VK_OAUTH_CLIENT_SECRET, чтобы {reason}. "
+                f"Сейчас один из них не задан."
+            )
+
+        access_token, new_refresh, expires_in = refresh_access_token(
+            refresh_token=refresh_token,
+            client_id=oauth_client_id,
+            client_secret=oauth_client_secret,
+        )
+        user_access_token = access_token
+
+        if new_refresh and new_refresh != refresh_token:
+            # Сообщим пользователю, что refresh_token обновился.
+            print(
+                "ВНИМАНИЕ: VK выдал новый refresh_token. "
+                "Обнови VK_USER_TOKEN в своём .env на значение ниже:\n"
+                f"{new_refresh}\n",
+                file=sys.stderr,
+            )
+            # Можем сразу начать использовать новый refresh в рамках этого запуска
+            refresh_token = new_refresh
+
+        return user_access_token
+
+    # 2) Картинки, которые надо загрузить через API
+    image_sources = args.images or []
+    if image_sources or args.edit:
+        access_token_for_upload = ensure_user_access_token("загрузить изображения в пост")
+
+    if image_sources:
+        try:
+            uploaded = upload_photos_for_wall(
                 group_id=group_id,
-                token=token,
+                access_token=access_token_for_upload,
                 image_sources=image_sources,
             )
-            if image_sources
-            else []
+            attachments.extend(uploaded)
+        except Exception as e:
+            print(f"Ошибка при загрузке изображений: {e}", file=sys.stderr)
+            return 1
+
+    # 3) Выбираем токен для wall.post / wall.edit
+    wall_token: Optional[str] = group_token if group_token else user_access_token
+
+    if wall_token is None:
+        # Нет токена сообщества — попробуем взять user access_token по refresh_token
+        try:
+            wall_token = ensure_user_access_token("вызвать wall.post / wall.edit")
+        except Exception as e:
+            print(
+                "Ошибка: нет VK_GROUP_TOKEN и не удалось получить user access_token "
+                "по VK_USER_TOKEN (refresh_token).\n"
+                f"Детали: {e}",
+                file=sys.stderr,
+            )
+            return 1
+
+    if wall_token is None:
+        print(
+            "Ошибка: нет ни VK_GROUP_TOKEN, ни рабочего VK_USER_TOKEN (refresh_token). "
+            "Невозможно вызвать wall.post / wall.edit.",
+            file=sys.stderr,
         )
-    except Exception as e:
-        print(f"Ошибка при загрузке изображений: {e}", file=sys.stderr)
         return 1
 
+    # 4) Собственно, постинг / редактирование
     try:
         if args.edit:
             post_id = edit_group_wall_post(
                 group_id=group_id,
-                token=token,
+                token=access_token_for_upload if access_token_for_upload else wall_token,
                 post_id=args.edit,
                 message=message,
                 attachments=attachments or None,
@@ -318,7 +447,7 @@ def main(argv=None) -> int:
         else:
             post_id = post_to_group_wall(
                 group_id=group_id,
-                token=token,
+                token=wall_token,
                 message=message,
                 attachments=attachments or None,
             )
